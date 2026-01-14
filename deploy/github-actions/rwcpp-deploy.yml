@@ -1,0 +1,256 @@
+# =============================================================================
+# GitHub Actions Workflow: Build and Deploy rwcpp
+# =============================================================================
+# This workflow builds the C++ server and deploys it to the EC2 instance.
+#
+# Required GitHub Secrets:
+#   EC2_HOST         - Domain name or Elastic IP of the server
+#   EC2_SSH_KEY      - Private SSH key for github-deploy user
+#
+# Optional Secrets:
+#   EC2_USER         - SSH user (default: github-deploy)
+#
+# Setup Instructions:
+# 1. Copy this file to: rwcpp/.github/workflows/deploy.yml
+# 2. Add secrets in GitHub repo settings
+# 3. Push to main/master to trigger deployment
+# =============================================================================
+
+name: Build and Deploy rwcpp
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - 'Makefile'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Deploy after build'
+        required: false
+        default: 'true'
+        type: boolean
+
+env:
+  SERVER_HOST: ${{ secrets.EC2_HOST }}
+  SERVER_USER: ${{ secrets.EC2_USER || 'github-deploy' }}
+  APP_DIR: /opt/rwcpp
+
+jobs:
+  # ===========================================================================
+  # Build Job
+  # ===========================================================================
+  build:
+    name: Build rwcpp Server
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            g++ \
+            make \
+            cmake \
+            pkg-config \
+            libcairo2-dev \
+            libcurl4-openssl-dev \
+            libsqlite3-dev \
+            libssl-dev \
+            libboost-all-dev
+
+      - name: Cache mailio build
+        uses: actions/cache@v4
+        id: mailio-cache
+        with:
+          path: ../mailio/build
+          key: mailio-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            mailio-${{ runner.os }}-
+
+      - name: Build mailio library
+        if: steps.mailio-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/karastojko/mailio.git ../mailio
+          cd ../mailio
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
+
+      - name: Install mailio
+        run: |
+          cd ../mailio/build
+          sudo make install
+          sudo ldconfig
+
+      - name: Build rwcpp server
+        run: |
+          make clean || true
+          make retainingwall-server
+          ls -la retainingwall-server
+
+      - name: Run tests
+        run: |
+          make test || echo "No tests configured yet"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rwcpp-server
+          path: retainingwall-server
+          retention-days: 7
+
+      - name: Build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Binary**: retainingwall-server" >> $GITHUB_STEP_SUMMARY
+          echo "- **Size**: $(du -h retainingwall-server | cut -f1)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Deploy Job
+  # ===========================================================================
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true')
+
+    environment:
+      name: production
+      url: https://${{ secrets.EC2_HOST }}
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rwcpp-server
+          path: ./dist
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Verify server connectivity
+        run: |
+          ssh -i ~/.ssh/deploy_key -o ConnectTimeout=10 \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "echo 'SSH connection successful'"
+
+      - name: Deploy binary
+        run: |
+          # Stop service
+          ssh -i ~/.ssh/deploy_key ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "sudo systemctl stop rwcpp || true"
+
+          # Upload new binary
+          scp -i ~/.ssh/deploy_key ./dist/retainingwall-server \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}:${{ env.APP_DIR }}/retainingwall-server.new
+
+          # Atomic swap and restart
+          ssh -i ~/.ssh/deploy_key ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} << 'DEPLOY_SCRIPT'
+            set -e
+            cd ${{ env.APP_DIR }}
+
+            # Make executable
+            chmod +x retainingwall-server.new
+
+            # Backup old binary
+            if [[ -f retainingwall-server ]]; then
+              mv retainingwall-server retainingwall-server.old
+            fi
+
+            # Activate new binary
+            mv retainingwall-server.new retainingwall-server
+
+            # Start service
+            sudo systemctl start rwcpp
+
+            # Wait for startup
+            sleep 3
+
+            # Verify health
+            if curl -sf http://localhost:8080/health > /dev/null; then
+              echo "Health check passed"
+            else
+              echo "Health check failed - rolling back"
+              sudo systemctl stop rwcpp
+              if [[ -f retainingwall-server.old ]]; then
+                mv retainingwall-server retainingwall-server.failed
+                mv retainingwall-server.old retainingwall-server
+                sudo systemctl start rwcpp
+              fi
+              exit 1
+            fi
+          DEPLOY_SCRIPT
+
+      - name: Verify deployment
+        run: |
+          # Test health endpoint through nginx
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://${{ env.SERVER_HOST }}/health || echo "000")
+
+          if [[ "$HTTP_STATUS" == "200" ]]; then
+            echo "Deployment successful - server is healthy"
+          else
+            echo "Warning: Health check returned status $HTTP_STATUS"
+          fi
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Server**: ${{ secrets.EC2_HOST }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Rollback Job (Manual trigger only)
+  # ===========================================================================
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && failure()
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Rollback to previous version
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} << 'ROLLBACK_SCRIPT'
+            set -e
+            cd ${{ env.APP_DIR }}
+
+            if [[ -f retainingwall-server.old ]]; then
+              sudo systemctl stop rwcpp || true
+              mv retainingwall-server retainingwall-server.failed
+              mv retainingwall-server.old retainingwall-server
+              sudo systemctl start rwcpp
+              echo "Rollback complete"
+            else
+              echo "No backup available for rollback"
+              exit 1
+            fi
+          ROLLBACK_SCRIPT

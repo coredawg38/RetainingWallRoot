@@ -1,0 +1,268 @@
+# =============================================================================
+# GitHub Actions Workflow: Build and Deploy Flutter Web UI
+# =============================================================================
+# This workflow builds the Flutter web application and deploys static files
+# to the EC2 instance.
+#
+# Required GitHub Secrets:
+#   EC2_HOST              - Domain name or Elastic IP of the server
+#   EC2_SSH_KEY           - Private SSH key for github-deploy user
+#   API_BASE_URL          - Full URL to API (e.g., https://retainingwall.example.com)
+#   STRIPE_PUBLISHABLE_KEY - Stripe public key (pk_live_...)
+#
+# Optional Secrets:
+#   EC2_USER              - SSH user (default: github-deploy)
+#
+# Setup Instructions:
+# 1. Copy this file to: webui/.github/workflows/deploy.yml
+# 2. Add secrets in GitHub repo settings
+# 3. Push to main/master to trigger deployment
+# =============================================================================
+
+name: Build and Deploy Flutter Web
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'lib/**'
+      - 'web/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  FLUTTER_VERSION: '3.32.0'
+  SERVER_HOST: ${{ secrets.EC2_HOST }}
+  SERVER_USER: ${{ secrets.EC2_USER || 'github-deploy' }}
+  WEB_DIR: /var/www/retainingwall
+
+jobs:
+  # ===========================================================================
+  # Build Job
+  # ===========================================================================
+  build:
+    name: Build Flutter Web
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Verify Flutter installation
+        run: |
+          flutter --version
+          flutter doctor -v
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Run code generation
+        run: |
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Analyze code
+        run: flutter analyze --no-fatal-infos
+
+      - name: Run tests
+        run: flutter test
+
+      - name: Build web (standard)
+        run: |
+          flutter build web --release \
+            --dart-define=ENVIRONMENT=production \
+            --dart-define=API_BASE_URL=${{ secrets.API_BASE_URL }} \
+            --dart-define=STRIPE_PUBLISHABLE_KEY=${{ secrets.STRIPE_PUBLISHABLE_KEY }}
+
+      - name: Build web (WASM)
+        run: |
+          flutter build web --release --wasm \
+            --dart-define=ENVIRONMENT=production \
+            --dart-define=API_BASE_URL=${{ secrets.API_BASE_URL }} \
+            --dart-define=STRIPE_PUBLISHABLE_KEY=${{ secrets.STRIPE_PUBLISHABLE_KEY }} \
+            --output=build/web_wasm
+
+      - name: Optimize build
+        run: |
+          # Compress files for faster transfer
+          cd build/web
+          find . -name "*.js" -exec gzip -9 -k {} \;
+          find . -name "*.css" -exec gzip -9 -k {} \;
+          find . -name "*.html" -exec gzip -9 -k {} \;
+
+      - name: Upload web build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-web-build
+          path: build/web
+          retention-days: 7
+
+      - name: Upload WASM build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-web-wasm-build
+          path: build/web_wasm
+          retention-days: 7
+
+      - name: Build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Flutter Version**: ${{ env.FLUTTER_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Size (web)**: $(du -sh build/web | cut -f1)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Size (wasm)**: $(du -sh build/web_wasm | cut -f1)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Deploy Job
+  # ===========================================================================
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
+      github.event_name == 'workflow_dispatch'
+
+    environment:
+      name: production
+      url: https://${{ secrets.EC2_HOST }}
+
+    steps:
+      - name: Download WASM build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flutter-web-wasm-build
+          path: ./web-build
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Verify server connectivity
+        run: |
+          ssh -i ~/.ssh/deploy_key -o ConnectTimeout=10 \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "echo 'SSH connection successful'"
+
+      - name: Deploy web files
+        run: |
+          # Create temp directory on server
+          ssh -i ~/.ssh/deploy_key ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} \
+            "rm -rf ~/web-deploy-temp && mkdir -p ~/web-deploy-temp"
+
+          # Upload files
+          scp -r -i ~/.ssh/deploy_key ./web-build/* \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}:~/web-deploy-temp/
+
+          # Atomic deployment
+          ssh -i ~/.ssh/deploy_key ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} << 'DEPLOY_SCRIPT'
+            set -e
+
+            # Backup current version
+            if [[ -d /var/www/retainingwall && ! -d /var/www/retainingwall.old ]]; then
+              sudo mv /var/www/retainingwall /var/www/retainingwall.old
+            elif [[ -d /var/www/retainingwall ]]; then
+              sudo rm -rf /var/www/retainingwall.older
+              sudo mv /var/www/retainingwall.old /var/www/retainingwall.older 2>/dev/null || true
+              sudo mv /var/www/retainingwall /var/www/retainingwall.old
+            fi
+
+            # Deploy new version
+            sudo mv ~/web-deploy-temp /var/www/retainingwall
+
+            # Set permissions
+            sudo chown -R www-data:www-data /var/www/retainingwall
+            sudo chmod -R 755 /var/www/retainingwall
+
+            echo "Deployment complete"
+          DEPLOY_SCRIPT
+
+      - name: Verify deployment
+        run: |
+          # Test that the site loads
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            https://${{ env.SERVER_HOST }}/ || echo "000")
+
+          if [[ "$HTTP_STATUS" == "200" ]]; then
+            echo "Deployment successful - site is accessible"
+          else
+            echo "Warning: Site returned status $HTTP_STATUS"
+          fi
+
+          # Check for Flutter app files
+          ssh -i ~/.ssh/deploy_key ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} << 'CHECK_SCRIPT'
+            if [[ -f /var/www/retainingwall/index.html ]] && \
+               [[ -f /var/www/retainingwall/main.dart.js || -f /var/www/retainingwall/main.dart.wasm ]]; then
+              echo "Flutter web files verified"
+            else
+              echo "Warning: Flutter web files may be incomplete"
+              ls -la /var/www/retainingwall/
+            fi
+          CHECK_SCRIPT
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Server**: ${{ secrets.EC2_HOST }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: https://${{ secrets.EC2_HOST }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Rollback Job (Manual trigger only)
+  # ===========================================================================
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && failure()
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Rollback to previous version
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} << 'ROLLBACK_SCRIPT'
+            set -e
+
+            if [[ -d /var/www/retainingwall.old ]]; then
+              sudo rm -rf /var/www/retainingwall.failed
+              sudo mv /var/www/retainingwall /var/www/retainingwall.failed 2>/dev/null || true
+              sudo mv /var/www/retainingwall.old /var/www/retainingwall
+              sudo chown -R www-data:www-data /var/www/retainingwall
+              echo "Rollback complete"
+            else
+              echo "No backup available for rollback"
+              exit 1
+            fi
+          ROLLBACK_SCRIPT

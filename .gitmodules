@@ -3,7 +3,7 @@
 	url = git@github.com:coredawg38/RetainingWall.git
 [submodule "webui"]
 	path = webui
-	url = git@github.com:tps-reports/retaining_wall_ui.git
+	url = https://github.com/coredawg38/RetainingWallUI.git
 [submodule "mailio"]
 	path = mailio
 	url = git@github.com:karastojko/mailio.git

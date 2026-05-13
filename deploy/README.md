@@ -88,9 +88,9 @@ deploy/
 
 Edit `aws/config.env`:
 ```bash
-export DOMAIN_NAME="your-domain.com"
-export SSH_KEY_NAME="your-key-pair-name"
-export ADMIN_EMAIL="admin@your-domain.com"
+export DOMAIN_NAME="retainingwallplan.com"
+export SSH_KEY_NAME="retaining_wall"
+export ADMIN_EMAIL="computer1@smithson1.com"
 ```
 
 ### Step 2: Create AWS Infrastructure
@@ -116,21 +116,22 @@ chmod +x *.sh
 
 ```bash
 # Copy scripts to server
-scp -i your-key.pem -r ../ec2 ubuntu@YOUR_ELASTIC_IP:~/
+scp -i retaining_wall.pem -r ../ec2 ubuntu@100.20.175.49:~/
+# scp -i retaining_wall.pem -r provision.sh ubuntu@100.20.175.49:~/
 
 # SSH to server
-ssh -i your-key.pem ubuntu@YOUR_ELASTIC_IP
+ssh -i retaining_wall.pem ubuntu@100.20.175.49
 
 # Run provisioning
 cd ~/ec2
-sudo ./provision.sh your-domain.com
+sudo ./provision.sh retainingwallplan.com
 ```
 
 ### Step 4: Configure SSL
 
 Wait for DNS to propagate (2-5 minutes), then:
 ```bash
-sudo ./setup-certbot.sh your-domain.com admin@your-domain.com
+sudo ./setup-certbot.sh retainingwallplan.com computer1@smithson1.com
 ```
 
 ### Step 5: Add Deploy Key

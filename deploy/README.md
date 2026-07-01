@@ -142,6 +142,17 @@ sudo nano /home/github-deploy/.ssh/authorized_keys
 # Paste the public key (see GitHub Actions setup below)
 ```
 
+### Step 5.5: Configure Passwordless Sudo
+
+The github-deploy user needs passwordless sudo for deployment. On the server:
+```bash
+sudo visudo
+# Add this line at the end:
+github-deploy ALL=(ALL) NOPASSWD: ALL
+# Or restrict to specific commands:
+# github-deploy ALL=(ALL) NOPASSWD: /bin/mv, /bin/chmod, /bin/chown, /bin/rm, /usr/bin/systemctl
+```
+
 ### Step 6: Configure Environment
 
 ```bash

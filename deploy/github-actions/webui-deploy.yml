@@ -44,7 +44,7 @@ on:
           - staging
 
 env:
-  FLUTTER_VERSION: '3.32.0'
+  FLUTTER_VERSION: '3.44.4'
   SERVER_HOST: ${{ secrets.EC2_HOST }}
   SERVER_USER: ${{ secrets.EC2_USER || 'github-deploy' }}
   WEB_DIR: /var/www/retainingwall

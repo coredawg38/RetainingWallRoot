@@ -201,6 +201,34 @@ jobs:
             echo "Deployment complete"
           DEPLOY_SCRIPT
 
+      - name: Ensure nginx serves .mjs as JavaScript
+        run: |
+          # Ubuntu's nginx mime.types has no entry for .mjs, so module scripts
+          # from the Flutter WASM build get served as application/octet-stream
+          # and browsers reject them under strict MIME checking. Insert a
+          # location block for .mjs into the site config if it is not there.
+          ssh -i ~/.ssh/deploy_key ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} << 'NGINX_SCRIPT'
+            set -euo pipefail
+            NGINX_CONF=/etc/nginx/sites-available/retainingwall
+
+            if sudo grep -q 'text/javascript mjs' "$NGINX_CONF"; then
+              echo "nginx already maps .mjs to text/javascript"
+              exit 0
+            fi
+
+            if ! sudo grep -q '# Static asset caching' "$NGINX_CONF"; then
+              echo "ERROR: marker '# Static asset caching' not found in $NGINX_CONF."
+              echo "Add the .mjs location block manually (see deploy/ec2/setup-certbot.sh)."
+              exit 1
+            fi
+
+            sudo sed -i 's|    # Static asset caching|    location ~* \\.mjs$ {\n        types { text/javascript mjs; }\n        expires 1y;\n        add_header Cache-Control "public, immutable";\n        access_log off;\n    }\n\n    # Static asset caching|' "$NGINX_CONF"
+
+            sudo nginx -t
+            sudo systemctl reload nginx
+            echo "nginx .mjs MIME mapping applied and reloaded"
+          NGINX_SCRIPT
+
       - name: Verify deployment
         run: |
           # Test that the site loads

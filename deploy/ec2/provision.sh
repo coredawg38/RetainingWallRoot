@@ -200,18 +200,19 @@ Type=simple
 User=${DEPLOY_USER}
 Group=${DEPLOY_USER}
 WorkingDirectory=${APP_DIR}
+ExecStartPre=/usr/bin/test -f ${APP_DIR}/retainingwall-server
 ExecStart=${APP_DIR}/retainingwall-server
-Restart=always
+Restart=on-failure
 RestartSec=5
 StandardOutput=append:${LOG_DIR}/server.log
 StandardError=append:${LOG_DIR}/error.log
-EnvironmentFile=${APP_DIR}/.env
+EnvironmentFile=-${APP_DIR}/.env
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${APP_DIR}/outputs ${APP_DIR}/data ${LOG_DIR}
+ReadWritePaths=${APP_DIR}/outputs ${APP_DIR}/data ${APP_DIR}/images ${APP_DIR}/inputs ${LOG_DIR}
 PrivateTmp=true
 
 [Install]

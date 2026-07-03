@@ -217,8 +217,18 @@ server {
         proxy_set_header Host \$host;
     }
 
+    # ES module scripts (Flutter WASM build) - Ubuntu's mime.types lacks an
+    # mjs entry, so without this nginx serves application/octet-stream and
+    # browsers reject the module under strict MIME checking
+    location ~* \.mjs$ {
+        types { text/javascript mjs; }
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
     # Static asset caching
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+    location ~* \.(js|css|wasm|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
         expires 1y;
         add_header Cache-Control "public, immutable";
         access_log off;
